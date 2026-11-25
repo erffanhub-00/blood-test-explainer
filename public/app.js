@@ -115,6 +115,41 @@ function upload(formData) {
   });
 }
 
+function testCard(test) {
+  const status = STATUS_LABELS[test.status] ? test.status : "unknown";
+  const card = el("article", "test " + status);
+  const header = el("div", "test-header");
+  const title = el("h3", "test-title");
+  title.appendChild(document.createTextNode(test.name));
+  if (test.abbr) title.appendChild(el("span", "abbr", "(" + test.abbr + ")"));
+  header.appendChild(title);
+  header.appendChild(el("span", "badge " + status, STATUS_LABELS[status]));
+  card.appendChild(header);
+
+  const grid = el("div", "values-grid");
+  const addField = (label, value) => {
+    if (value === null || value === undefined || value === "") return;
+    const cell = el("div", "cell");
+    cell.appendChild(el("span", "lbl", label));
+    cell.appendChild(el("span", "val", value));
+    grid.appendChild(cell);
+  };
+  addField("مقدار", test.value);
+  addField("واحد", test.unit);
+  addField("بازه مرجع", test.reference_range);
+  if (grid.children.length) card.appendChild(grid);
+  if (test.explanation) {
+    const d = el("details", "test-explanation");
+    d.open = status !== "normal";
+    const s = el("summary", "", status === "normal" ? "توضیح بیشتر" : "توضیح");
+    s.setAttribute("aria-expanded", String(d.open));
+    d.addEventListener("toggle", () => s.setAttribute("aria-expanded", String(d.open)));
+    d.append(s, el("p", "", test.explanation));
+    card.appendChild(d);
+  }
+  return card;
+}
+
 function renderResult(data) {
   const tests = data.tests || [];
   const normal = tests.filter((t) => t.status === "normal").length;
@@ -132,37 +167,23 @@ function renderResult(data) {
   };
   addStat(tests.length, "کل موارد", "");
   addStat(normal, "داخل بازه", "ok");
-  addStat(abnormal + unknown, "نیازمند بررسی", abnormal > 0 ? "danger" : unknown > 0 ? "warn" : "ok");
+  addStat(abnormal, "خارج از بازه", abnormal > 0 ? "danger" : "");
+  addStat(unknown, "بدون بازه", unknown > 0 ? "warn" : "");
 
   document.getElementById("summary").textContent = data.summary || "خلاصه‌ای ارائه نشد.";
 
   const container = document.getElementById("tests");
   container.replaceChildren();
-  for (const test of tests) {
-    const status = STATUS_LABELS[test.status] ? test.status : "unknown";
-    const card = el("article", "test " + status);
-    const header = el("div", "test-header");
-    const title = el("h3", "test-title");
-    title.appendChild(document.createTextNode(test.name));
-    if (test.abbr) title.appendChild(el("span", "abbr", "(" + test.abbr + ")"));
-    header.appendChild(title);
-    header.appendChild(el("span", "badge " + status, STATUS_LABELS[status]));
-    card.appendChild(header);
-
-    const grid = el("div", "values-grid");
-    const addField = (label, value) => {
-      if (value === null || value === undefined || value === "") return;
-      const cell = el("div", "cell");
-      cell.appendChild(el("span", "lbl", label));
-      cell.appendChild(el("span", "val", value));
-      grid.appendChild(cell);
-    };
-    addField("مقدار", test.value);
-    addField("واحد", test.unit);
-    addField("بازه مرجع", test.reference_range);
-    if (grid.children.length) card.appendChild(grid);
-    if (test.explanation) card.appendChild(el("p", "test-explanation", test.explanation));
-    container.appendChild(card);
+  const sections = [
+    ["hematology", "هماتولوژی"],
+    ["biochemistry", "بیوشیمی"],
+    ["other", "سایر"],
+  ];
+  for (const [key, title] of sections) {
+    const group = tests.filter((t) => (t.section || "other") === key);
+    if (!group.length) continue;
+    container.appendChild(el("h3", "section-title", title));
+    for (const test of group) container.appendChild(testCard(test));
   }
 
   const limBox = document.getElementById("limitations");

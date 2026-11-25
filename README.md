@@ -18,6 +18,11 @@
    - جمله توضیح از یک قالب ثابت و با همان وضعیت تاییدشده ساخته می‌شود؛ جمله آزاد مدل هرگز استفاده نمی‌شود.
 5. فایل ذخیره نمی‌شود و بعد از پردازش نگه داشته نمی‌شود.
 
+### نکته‌ها
+
+- در بسیاری از برگه‌ها، شمارش افتراقی (نوتروفیل، لنفوسیت، مونوسیت، ائوزینوفیل) بازه مرجع ندارد؛ این موارد با وضعیت «نامشخص» و جمله «بازه روی برگه نیست» نشان داده می‌شوند، نه با مقایسه حدسی.
+- برگه PDF اسکن‌شده یا عکس‌گرفته‌شده متن ندارد؛ اگر متن PDF خوانا نباشد، خطای واضح می‌گیرید و باید عکس واضح برگه را بفرستید.
+
 ### چرا جمله و برچسب نمی‌توانند با هم تناقض داشته باشند؟
 
 در نسخه قبلی، مدل جمله توضیح را می‌نوشت و کد فقط برچسب را عوض می‌کرد؛ برای همین کلسترول ۲۱۰ با بازه ۰ تا ۲۰۰ برچسب «بالاتر از محدوده» داشت ولی جمله‌اش می‌گفت «در محدوده است». در این نسخه برچسب و جمله هر دو از یک متغیر وضعیت ساخته می‌شوند:
@@ -84,6 +89,11 @@ Upload a blood test sheet (PDF or photo) and get each result explained in simple
    - The status (in range / above / below / unknown) is computed in code by comparing the number with the range.
    - The explanation sentence is built from a fixed template using that same validated status — the model's free sentence is never used.
 5. The file is never stored permanently.
+
+### Notes
+
+- On many sheets the differential count (Neutrophil, Lymphocyte, Monocyte, Eosinophil) has no reference range; those show as "unknown" with "no range on the sheet", never a guessed comparison.
+- A scanned or photographed PDF has no text; if the PDF text is unreadable you get a clear error and should send a clear photo of the sheet instead.
 
 ## Run
 

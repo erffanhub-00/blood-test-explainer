@@ -96,34 +96,50 @@ export function displayRange(range: string): string | null {
   return s;
 }
 
+/** Format a numeric gap without trailing ".0" ("0.9" stays "0.9"). */
+function fmtGap(n: number): string {
+  return String(Math.round(n * 1000) / 1000);
+}
+
 /** Explanation built from a template using the VALIDATED status only.
  *  The model's free sentence is never reused — that was the old bug:
- *  the badge said "high" while the sentence said "in range". */
+ *  the badge said "high" while the sentence said "in range".
+ *  Out-of-range sentences quantify the gap (value − bound, with unit). */
 export function buildExplanation(
   value: string | null,
   range: string | null,
   status: Status,
   info: string,
+  unit?: string | null,
 ): string {
   if (value === null) return `${info} مقدار آن خوانا نیست.`;
   const v = parseValue(value);
   const r = parseRange(range);
   if (v === null) return `${info} مقدار آن خوانا نیست.`;
   if (r === null || range === null) {
-    return `${info} مقدار ${value} ثبت شده است، اما بازه روی برگه نیست، برای تفسیر به پزشک مراجعه کن.`;
+    return `${info} مقدار ${value} ثبت شده است، اما بازه روی برگه نیست، پس نمی‌توان گفت داخل بازه است یا نه؛ برای تفسیر به پزشک مراجعه کن.`;
   }
+  const u = unit ? ` ${unit}` : "";
   if (r.kind === "range") {
     const span = displayRange(range) ?? `${r.low} تا ${r.high}`;
-    if (status === "low") return `${info} مقدار ${value} پایین‌تر از بازه ${span} روی برگه است.`;
-    if (status === "high") return `${info} مقدار ${value} بالاتر از بازه ${span} روی برگه است.`;
+    if (status === "low") {
+      return `${info} مقدار ${value} پایین‌تر از بازه ${span} روی برگه است؛ فقط ${fmtGap(r.low - v)}${u} کمتر از حد پایین بازه است.`;
+    }
+    if (status === "high") {
+      return `${info} مقدار ${value} بالاتر از بازه ${span} روی برگه است؛ ${fmtGap(v - r.high)}${u} بالاتر از حد بالای بازه است.`;
+    }
     return `${info} مقدار ${value} در بازه ${span} روی برگه است.`;
   }
   if (r.kind === "max") {
-    const verb = status === "high" ? "بیشتر از" : "کمتر از";
-    return `${info} مقدار ${value} ${verb} ${r.max} روی برگه است.`;
+    if (status === "high") {
+      return `${info} مقدار ${value} بیشتر از ${r.max} روی برگه است؛ ${fmtGap(v - r.max)}${u} بالاتر از حداکثر بازه است.`;
+    }
+    return `${info} مقدار ${value} کمتر از ${r.max} روی برگه است.`;
   }
-  const verb = status === "low" ? "کمتر از" : "بیشتر از";
-  return `${info} مقدار ${value} ${verb} ${r.min} روی برگه است.`;
+  if (status === "low") {
+    return `${info} مقدار ${value} کمتر از ${r.min} روی برگه است؛ ${fmtGap(r.min - v)}${u} پایین‌تر از حداقل بازه است.`;
+  }
+  return `${info} مقدار ${value} بیشتر از ${r.min} روی برگه است.`;
 }
 
 function safeText(value: unknown, maxLength: number): string | null {
@@ -168,15 +184,20 @@ export function processTests(
     if (value !== null && !isGrounded(value, sourceText)) value = null;
     if (range !== null && !isGrounded(range, sourceText)) range = null;
 
+    const section = raw?.section === "hematology" || raw?.section === "biochemistry"
+      ? raw.section
+      : "other";
     const status = validateStatus(value, range);
-    const explanation = buildExplanation(value, range, status, info);
+    const unit = safeText(raw?.unit, 50);
+    const explanation = buildExplanation(value, range, status, info, unit);
     tests.push({
       name,
       abbr: abbr ? normalizeDigits(abbr) : null,
       value,
-      unit: safeText(raw?.unit, 50),
+      unit,
       reference_range: range,
       status,
+      section,
       explanation,
     });
 
@@ -189,6 +210,32 @@ export function processTests(
     }
   }
   return { tests, limitations };
+}
+
+/** Retry the AI call when ranges are systematically missing: fewer
+ *  than half of the valued tests have a range (range-less rows are few). */
+export function needsRangesRetry(tests: Test[]): boolean {
+  const valued = tests.filter((t) => t.value !== null);
+  if (valued.length === 0) return false;
+  const ranged = valued.filter((t) => t.reference_range !== null).length;
+  return ranged / valued.length < 0.5;
+}
+
+/** Merge a retry that refills missing ranges, matched by canonical
+ *  or raw name. Values are never overwritten. */
+export function mergeRanges(original: RawTest[], retry: RawTest[]): RawTest[] {
+  const byName = new Map<string, RawTest>();
+  for (const r of retry) {
+    const entry = canonical(r.abbr ?? null, r.name ?? null);
+    if (entry) byName.set(entry[0], r);
+    if (r.name) byName.set(r.name, r);
+  }
+  return original.map((t) => {
+    if (t.reference_range) return t;
+    const entry = canonical(t.abbr ?? null, t.name ?? null);
+    const hit = (entry ? byName.get(entry[0]) : undefined) ?? (t.name ? byName.get(t.name) : undefined);
+    return hit?.reference_range ? { ...t, reference_range: hit.reference_range } : t;
+  });
 }
 
 /** Keep a model limitation only if it does not contradict a test

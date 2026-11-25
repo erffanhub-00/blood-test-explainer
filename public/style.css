@@ -8,6 +8,7 @@
   --radius: 16px; --radius-sm: 12px;
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { overflow-x: hidden; }
 body {
   margin: 0; background: var(--bg); color: var(--text);
   font-family: "Vazirmatn", Tahoma, Arial, sans-serif;
@@ -83,7 +84,7 @@ button.secondary {
   background: var(--primary-soft); color: var(--primary); border-radius: 999px;
   padding: 3px 12px; font-size: 12.5px; font-weight: 700; direction: ltr;
 }
-.stats-bar { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 20px; }
+.stats-bar { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 20px; }
 .stat {
   background: #fff; border: 1px solid var(--border); border-radius: var(--radius-sm);
   padding: 12px 8px; text-align: center;
@@ -93,6 +94,12 @@ button.secondary {
 .stat.ok .num { color: var(--ok); }
 .stat.warn .num { color: var(--low); }
 .stat.danger .num { color: var(--high); }
+.section-title {
+  font-size: 16px; font-weight: 800; margin: 22px 0 4px;
+  padding-bottom: 8px; border-bottom: 2px solid var(--primary);
+  color: var(--primary);
+}
+.section-title:first-child { margin-top: 4px; }
 .test {
   border: 1px solid var(--border); border-radius: var(--radius-sm);
   padding: 16px 18px; margin-top: 12px; position: relative; overflow: hidden;
@@ -127,8 +134,13 @@ button.secondary {
   border-top: 1px dashed var(--border); border-bottom: 1px dashed var(--border);
 }
 .values-grid .lbl { color: var(--muted); display: block; font-size: 11.5px; }
-.values-grid .val { font-weight: 800; font-size: 15px; direction: ltr; text-align: right; display: block; }
-.test-explanation { font-size: 14px; color: #475569; margin: 0; }
+.values-grid .val { font-weight: 800; font-size: 15px; direction: ltr; text-align: right; display: block; overflow-wrap: anywhere; }
+details.test-explanation { font-size: 14px; color: #475569; }
+details.test-explanation summary {
+  cursor: pointer; font-weight: 700; color: var(--primary);
+  min-height: 44px; display: flex; align-items: center;
+}
+details.test-explanation p { margin: 8px 0 0; }
 .limitations-box {
   margin-top: 20px; padding: 16px 20px; background: var(--low-bg);
   border: 1px solid var(--low-border); border-radius: var(--radius-sm);
@@ -151,6 +163,7 @@ button.secondary {
   .card { padding: 18px; }
   .upload { padding: 24px 14px; }
   .stat .num { font-size: 18px; }
+  .stats-bar { grid-template-columns: repeat(2, 1fr); }
   .values-grid { grid-template-columns: repeat(2, 1fr); }
   .actions { grid-template-columns: 1fr; }
 }

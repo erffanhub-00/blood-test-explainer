@@ -18,6 +18,8 @@ export interface Env {
 
 export type Status = "normal" | "low" | "high" | "unknown";
 
+export type Section = "hematology" | "biochemistry" | "other";
+
 /** One test exactly as the model returns it. No status, no explanation:
  *  both are computed in code from the validated numbers. */
 export interface RawTest {
@@ -26,6 +28,7 @@ export interface RawTest {
   value?: string | number | null;
   unit?: string | null;
   reference_range?: string | null;
+  section?: string | null;
 }
 
 export interface Test {
@@ -35,6 +38,7 @@ export interface Test {
   unit: string | null;
   reference_range: string | null;
   status: Status;
+  section: Section;
   explanation: string;
 }
 
