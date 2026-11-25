@@ -4,6 +4,8 @@
 
 برگه آزمایش (PDF یا عکس) را ارسال کنید تا هر نتیجه به زبان ساده فارسی توضیح داده شود — فقط با اعداد روی همان برگه، بدون تشخیص و بدون توصیه درمانی.
 
+🌐 **نسخه زنده:** [blood-test-explainer.erffanhub.workers.dev](https://blood-test-explainer.erffanhub.workers.dev)
+
 > این توضیحات صرفاً برای آگاهی عمومی هستند و جایگزین نظر پزشک نیستند.
 
 ## امکانات
@@ -112,6 +114,8 @@ npm run deploy
 # English
 
 Upload a lab sheet (PDF or photo) and get each result explained in simple Persian — using only the numbers printed on that sheet. No diagnosis, no treatment advice.
+
+🌐 **Live demo:** [blood-test-explainer.erffanhub.workers.dev](https://blood-test-explainer.erffanhub.workers.dev)
 
 > These explanations are for general information only and do not replace a doctor's opinion.
 
