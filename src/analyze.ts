@@ -8,22 +8,37 @@ import {
   type AnalysisResult,
   type Env,
   type RawTest,
-  type Section,
   type Test,
 } from "./types.js";
 import { OUTPUT_SCHEMA, SYSTEM_PROMPT, TRANSCRIPTION_SYSTEM_PROMPT, buildPrompt, buildRangeColumnPrompt, buildTranscriptionPrompt, sectionPrompt } from "./prompt.js";
 import { countTranscription, filterLimitations, mergeRanges, needsRangesRetry, parseAiOutput, parseRangeColumn, processTests, sanitizeSummary } from "./validation.js";
 import { extractPdfText, parsePdfTable, shouldUseDeterministicParse } from "./pdfparse.js";
 import { Jimp } from "jimp";
-
-/** Hard cap on Workers AI calls per request. Worst case the budget
- *  guard skips the last passes; each pass runs only while ranges are
- *  still missing, and early exit keeps the normal case at 1 call. */
-const MAX_AI_CALLS = 8;
+import {
+  CALL_BUDGET,
+  CALL_TIMEOUT_MS,
+  TIME_BUDGET_MS,
+  analyzeGaps,
+  decideNext,
+  roundProgress,
+  roundStageName,
+  scoreTests,
+  type PipelineCtx,
+  type StageId,
+  type StopReason,
+} from "./pipeline.js";
 
 /** Note for the ranges-only retry: the first pass dropped most ranges. */
 const RANGES_RETRY_NOTE =
   "در پاسخ قبلی محدوده مرجع بیشتر آزمایش‌ها خالی بود، در حالی که روی برگه برای بیشتر آزمایش‌ها بازه چاپ شده است. این بار فقط محدوده مرجع هر سطر را از ستون Reference Interval بخوان؛ مقدار و واحد را همان‌طور که هست تکرار کن. بازه را null نگذار مگر اینکه در آن سطر واقعاً بازه‌ای چاپ نشده باشد.";
+
+class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -117,19 +132,41 @@ function callText(env: Env, userContent: UserContent, maxTokens = 4000): Promise
   return callModel(env, TRANSCRIPTION_SYSTEM_PROMPT, userContent, { guidedJson: false, maxTokens });
 }
 
-/** One JSON log line per pass: strategy, model, tests returned, ranges found. */
-function logPass(requestId: string, pass: string, tests: number, ranges: number, model?: string): void {
-  console.log(JSON.stringify({ level: "info", context: "extraction_pass", requestId, pass, model: model ?? MODEL, tests, ranges }));
+/** Race a promise against a timer. Workers AI takes no abort signal,
+ *  so a timeout just lets the pipeline move on; a late result is ignored. */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  if (ms <= 0) return Promise.reject(new Error("timeout"));
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("timeout")), ms);
+  });
+  return Promise.race([
+    promise.then(
+      (v) => { clearTimeout(timer); return v; },
+      (e) => { clearTimeout(timer); throw e; },
+    ),
+    timeout,
+  ]);
+}
+
+/** One JSON log line per pass: strategy, model, tests returned, ranges
+ *  found, round, and wall time. */
+function logPass(
+  requestId: string,
+  pass: string,
+  tests: number,
+  ranges: number,
+  extra?: { model?: string; round?: number; durationMs?: number },
+): void {
+  console.log(JSON.stringify({
+    level: "info", context: "extraction_pass", requestId, pass,
+    model: extra?.model ?? MODEL, tests, ranges,
+    round: extra?.round, durationMs: extra?.durationMs,
+  }));
 }
 
 function rangedCount(raw: RawTest[]): number {
   return raw.filter((t) => t.reference_range).length;
-}
-
-/** True when a section still has valued tests without a range. */
-function sectionNeedsRetry(tests: Test[], section: Section): boolean {
-  const valued = tests.filter((t) => t.section === section && t.value !== null);
-  return valued.length > 0 && valued.some((t) => t.reference_range === null);
 }
 
 /** Enhanced variant: normalize + greyscale + sharpen, downscaled only
@@ -147,7 +184,283 @@ async function enhanceImage(bytes: Uint8Array): Promise<string | null> {
   }
 }
 
-export async function analyze(request: Request, env: Env, requestId: string): Promise<Response> {
+interface StageOutcome {
+  kind: "json" | "range_column" | "transcription";
+  raw: RawTest[];
+  transcription?: string;
+  summary?: string | null;
+  limitations?: string[];
+}
+
+interface PipelineInput {
+  env: Env;
+  requestId: string;
+  imageDataUri: string | null;
+  bytes: Uint8Array;
+  documentText: string;
+  isWebp: boolean;
+  callTimeoutMs: number;
+  timeBudgetMs: number;
+  send: (event: Record<string, unknown>) => void;
+}
+
+/** The manager loop: ask pipeline.ts what to run next, run that round's
+ *  stages concurrently, merge, score, repeat — until goodEnough, the
+ *  budget is spent, or no stage can help anymore. Returns the final
+ *  result plus the reason the manager stopped. */
+async function runPipeline(
+  input: PipelineInput,
+): Promise<{ result: AnalysisResult; stopReason: StopReason }> {
+  const { env, requestId, imageDataUri, bytes, documentText } = input;
+  const startedAt = Date.now();
+  const elapsed = (): number => Date.now() - startedAt;
+  const remainingMs = (): number => input.timeBudgetMs - elapsed();
+  const timeoutMs = (): number => Math.min(input.callTimeoutMs, Math.max(0, remainingMs()));
+
+  const reportSuffix = documentText
+    ? `\n\nمتن استخراج‌شده از PDF:\n<REPORT>\n${documentText.slice(0, 20000)}\n</REPORT>`
+    : "";
+  const makeUserContent = (promptText: string): UserContent =>
+    imageDataUri
+      ? [
+          { type: "text", text: promptText },
+          { type: "image_url", image_url: { url: imageDataUri } },
+        ]
+      : promptText;
+  const userContent = makeUserContent(buildPrompt() + reportSuffix);
+
+  let callsUsed = 0;
+  let stagesRun: StageId[] = [];
+  let rawTests: RawTest[] = [];
+  let tests: Test[] = [];
+  let limitations: string[] = [];
+  let summary: string | null = null;
+  let modelLimitations: string[] = [];
+  let aiOk = false;
+
+  /** Charge the call budget right before an AI invocation. */
+  const charge = (n: number): boolean => {
+    if (callsUsed + n > CALL_BUDGET) return false;
+    callsUsed += n;
+    return true;
+  };
+
+  /** One AI call with the per-call timeout (capped by the remaining
+   *  time budget). Sets aiOk when the call itself answers. */
+  async function timed<T>(promise: Promise<T>, label: string): Promise<T> {
+    const ms = timeoutMs();
+    if (ms <= 0) throw new Error(`timeout:${label}`);
+    const out = await withTimeout(promise, ms);
+    aiOk = true;
+    return out;
+  }
+
+  /** Run one stage. A failing or timed-out stage returns null and
+   *  never fails the request — the best result so far wins. */
+  async function runStage(stage: StageId, roundNo: number): Promise<StageOutcome | null> {
+    const started = Date.now();
+    const done = (outcome: StageOutcome | null, model?: string): StageOutcome | null => {
+      logPass(requestId, stage, outcome ? outcome.raw.length : 0,
+        outcome ? rangedCount(outcome.raw) : 0,
+        { model, round: roundNo, durationMs: Date.now() - started });
+      return outcome;
+    };
+    try {
+      switch (stage) {
+        case "full": {
+          if (!charge(1)) return done(null);
+          const out = await timed(callAi(env, userContent, { maxTokens: 8000 }), "full");
+          const parsed = parseAiOutput(out);
+          if (!parsed) return done(null);
+          return done({ kind: "json", raw: parsed.tests, summary: parsed.summary, limitations: parsed.limitations });
+        }
+        case "range_column": {
+          if (!imageDataUri || !charge(1)) return done(null);
+          const text = await timed(callText(env, [
+            { type: "text", text: buildRangeColumnPrompt() },
+            { type: "image_url", image_url: { url: imageDataUri } },
+          ], 1500), "range_column");
+          return done({ kind: "range_column", raw: parseRangeColumn(text) });
+        }
+        case "ranges_only": {
+          if (!charge(1)) return done(null);
+          const out = await timed(callAi(env, makeUserContent(`${RANGES_RETRY_NOTE}\n\n${buildPrompt()}${reportSuffix}`), { maxTokens: 2000, temperature: 0, topP: 1 }), "ranges_only");
+          const parsed = parseAiOutput(out);
+          if (!parsed) return done(null);
+          return done({ kind: "json", raw: parsed.tests, summary: parsed.summary, limitations: parsed.limitations });
+        }
+        case "section_hematology":
+        case "section_biochemistry": {
+          if (!charge(1)) return done(null);
+          const section = stage === "section_hematology" ? "hematology" : "biochemistry";
+          const out = await timed(callAi(env, makeUserContent(`${sectionPrompt(section)}${reportSuffix}`), { maxTokens: 4000 }), stage);
+          const parsed = parseAiOutput(out);
+          if (!parsed) return done(null);
+          return done({ kind: "json", raw: parsed.tests, summary: parsed.summary, limitations: parsed.limitations });
+        }
+        case "transcription": {
+          if (!imageDataUri || !charge(1)) return done(null);
+          const text = await timed(callText(env, [
+            { type: "text", text: buildTranscriptionPrompt() },
+            { type: "image_url", image_url: { url: imageDataUri } },
+          ], 4000), "transcription");
+          return done({ kind: "transcription", raw: [], transcription: text });
+        }
+        case "alt_model_1":
+        case "alt_model_2": {
+          const idx = stage === "alt_model_1" ? 0 : 1;
+          if (!charge(1)) return done(null);
+          const model = MODEL_FALLBACKS[idx];
+          const out = await timed(callAi(env, userContent, { model, guidedJson: false, maxTokens: 8000 }), stage);
+          const parsed = parseAiOutput(out);
+          if (!parsed) return done(null, model);
+          return done({ kind: "json", raw: parsed.tests, summary: parsed.summary, limitations: parsed.limitations }, model);
+        }
+        case "enhanced_image": {
+          if (!imageDataUri) return done(null);
+          const enhanced = await enhanceImage(bytes);
+          if (!enhanced) return done(null);
+          if (!charge(1)) return done(null);
+          const out = await timed(callAi(env, [
+            { type: "text", text: buildPrompt() },
+            { type: "image_url", image_url: { url: enhanced } },
+          ], { maxTokens: 8000 }), stage);
+          const parsed = parseAiOutput(out);
+          if (!parsed) return done(null);
+          return done({ kind: "json", raw: parsed.tests, summary: parsed.summary, limitations: parsed.limitations });
+        }
+      }
+    } catch (e) {
+      console.error(JSON.stringify({ level: "error", context: "extraction_pass_failed", requestId, pass: stage, error: e instanceof Error ? e.message : "unknown" }));
+      return null;
+    }
+  }
+
+  /** Merge one round's outcomes. Ranges alone cannot create tests;
+   *  a JSON outcome adopts wholesale when the base is still empty. */
+  function mergeOutcomes(outcomes: Array<PromiseSettledResult<StageOutcome | null>>): string | null {
+    let transcriptionText: string | null = null;
+    for (const o of outcomes) {
+      if (o.status !== "fulfilled" || !o.value) continue;
+      const oc = o.value;
+      if (oc.transcription) transcriptionText = oc.transcription;
+      if (oc.summary && !summary) summary = oc.summary;
+      if (oc.limitations && modelLimitations.length === 0) modelLimitations = oc.limitations;
+      if (oc.raw.length === 0) continue;
+      if (oc.kind === "range_column" && rawTests.length === 0) continue;
+      if (rawTests.length === 0) rawTests = oc.raw;
+      else rawTests = mergeRanges(rawTests, oc.raw);
+    }
+    return transcriptionText;
+  }
+
+  function reprocess(): void {
+    const done = processTests(rawTests, documentText);
+    tests = done.tests;
+    limitations = done.limitations;
+  }
+
+  let roundNo = 0;
+  let stopReason: StopReason = "all_strategies_tried";
+
+  while (true) {
+    const score = scoreTests(tests);
+    const gaps = analyzeGaps(tests);
+    const ctx: PipelineCtx = {
+      score,
+      stagesRun,
+      callsUsed,
+      callsBudget: CALL_BUDGET,
+      elapsedMs: elapsed(),
+      timeBudgetMs: input.timeBudgetMs,
+      hasImage: imageDataUri !== null,
+      isWebp: input.isWebp,
+      lackingSections: gaps.lackingSections,
+      valueGapSections: gaps.valueGapSections,
+    };
+    const decision = decideNext(ctx);
+    console.log(JSON.stringify({ level: "info", context: "pipeline_decision", requestId, round: roundNo + 1, action: decision.action, stages: decision.stages, reason: decision.reason, callsUsed, elapsedMs: elapsed() }));
+    if (decision.action === "stop") {
+      stopReason = decision.reason;
+      break;
+    }
+    stagesRun = [...stagesRun, ...decision.stages];
+    roundNo++;
+    input.send({
+      stage: roundStageName(decision.stages),
+      progress: roundProgress(roundNo),
+      elapsedSec: Math.floor(elapsed() / 1000),
+    });
+    const outcomes = await Promise.allSettled(decision.stages.map((s) => runStage(s, roundNo)));
+    const transcriptionText = mergeOutcomes(outcomes);
+    reprocess();
+
+    // Transcription structuring: one text-only call, only when the
+    // transcription has rows and ranges are still missing.
+    if (transcriptionText) {
+      const counted = countTranscription(transcriptionText);
+      if (counted.rows > 0 && needsRangesRetry(tests) && charge(1)) {
+        const started = Date.now();
+        try {
+          const out = await timed(
+            callAi(env, `${buildPrompt()}\n\nمتن رونویسی‌شده از برگه:\n<REPORT>\n${transcriptionText.slice(0, 20000)}\n</REPORT>`, { maxTokens: 8000 }),
+            "transcription_structure",
+          );
+          const parsed = parseAiOutput(out);
+          logPass(requestId, "transcription_structure", parsed ? parsed.tests.length : 0,
+            parsed ? rangedCount(parsed.tests) : 0, { round: roundNo, durationMs: Date.now() - started });
+          if (parsed && parsed.tests.length > 0) {
+            if (rawTests.length === 0) rawTests = parsed.tests;
+            else rawTests = mergeRanges(rawTests, parsed.tests);
+            if (parsed.summary && !summary) summary = parsed.summary;
+            if (parsed.limitations && modelLimitations.length === 0) modelLimitations = parsed.limitations;
+            reprocess();
+          }
+        } catch {
+          // Keep the best result so far; missing ranges stay unknown.
+        }
+      }
+    }
+
+    // Empty result after round 1: the model sometimes returns an empty
+    // list on a first pass — retry the full call once.
+    if (roundNo === 1 && tests.length === 0 && callsUsed < CALL_BUDGET) {
+      const retry = await runStage("full", roundNo);
+      if (retry && retry.raw.length > 0) {
+        rawTests = retry.raw;
+        if (retry.summary && !summary) summary = retry.summary;
+        if (retry.limitations && modelLimitations.length === 0) modelLimitations = retry.limitations;
+        reprocess();
+      }
+    }
+  }
+
+  if (tests.length === 0) {
+    if (!aiOk) throw new ApiError("سرویس هوش مصنوعی در دسترس نیست. لطفاً دوباره تلاش کنید.", 502);
+    throw new ApiError("در این فایل آزمایش پیدا نشد. لطفاً برگه آزمایش ارسال کنید.", 422);
+  }
+  const result: AnalysisResult = {
+    summary: sanitizeSummary(summary) || `این گزارش آزمایش خون شامل نتایج ${tests.length} آزمایش است.`,
+    tests,
+    limitations: [...limitations, ...filterLimitations(modelLimitations, tests)],
+    disclaimer: DISCLAIMER,
+    requestId,
+  };
+  console.log(JSON.stringify({
+    level: "info", context: "analysis_completed", requestId,
+    totalTests: tests.length,
+    unknownTests: tests.filter((t) => t.status === "unknown").length,
+    stopReason, callsUsed,
+  }));
+  return { result, stopReason };
+}
+
+export async function analyze(
+  request: Request,
+  env: Env,
+  requestId: string,
+  opts: { callTimeoutMs?: number; timeBudgetMs?: number } = {},
+): Promise<Response> {
   if (!env.AI) return error("اتصال هوش مصنوعی تنظیم نشده است.", requestId, 500);
 
   let form: FormData;
@@ -237,188 +550,62 @@ export async function analyze(request: Request, env: Env, requestId: string): Pr
     imageDataUri = `data:${file.type || "image/jpeg"};base64,${toBase64(bytes)}`;
   }
 
-  const reportSuffix = documentText
-    ? `\n\nمتن استخراج‌شده از PDF:\n<REPORT>\n${documentText.slice(0, 20000)}\n</REPORT>`
-    : "";
-  const makeUserContent = (promptText: string): UserContent =>
-    imageDataUri
-      ? [
-          { type: "text", text: promptText },
-          { type: "image_url", image_url: { url: imageDataUri } },
-        ]
-      : promptText;
-  const userContent = makeUserContent(buildPrompt() + reportSuffix);
-
-  let aiCalls = 0;
-  let output: string;
-  try {
-    output = await callAi(env, userContent);
-    aiCalls++;
-  } catch {
-    return error("سرویس هوش مصنوعی در دسترس نیست. لطفاً دوباره تلاش کنید.", requestId, 502);
-  }
-
-  let data = parseAiOutput(output);
-  if (!data) {
-    return error("پاسخ هوش مصنوعی قابل پردازش نبود.", requestId, 502);
-  }
-  if (data.tests.length === 0) {
-    // Retry once: the model sometimes returns an empty list on a first pass.
-    try {
-      output = await callAi(env, userContent);
-      aiCalls++;
-    } catch {
-      return error("سرویس هوش مصنوعی در دسترس نیست. لطفاً دوباره تلاش کنید.", requestId, 502);
-    }
-    data = parseAiOutput(output);
-    if (!data) {
-      return error("پاسخ هوش مصنوعی قابل پردازش نبود.", requestId, 502);
-    }
-    if (data.tests.length === 0) {
-      return error("در این فایل آزمایش پیدا نشد. لطفاً برگه آزمایش ارسال کنید.", requestId, 422);
-    }
-  }
-
-  let rawTests = data.tests;
-  let { tests, limitations } = processTests(rawTests, documentText);
-  logPass(requestId, "pass1_full", rawTests.length, rangedCount(rawTests));
-
-  // Merge a fallback's raw tests; adopt only when it adds a range.
-  function adoptMerged(merged: RawTest[]): boolean {
-    const redone = processTests(merged, documentText);
-    if (redone.tests.some((t) => t.reference_range !== null)) {
-      rawTests = merged;
-      tests = redone.tests;
-      limitations = redone.limitations;
-    }
-    return !needsRangesRetry(tests);
-  }
-
-  // One fallback JSON pass: merge what it found; a failing pass never
-  // fails the request — the best result so far wins.
-  async function tryJsonPass(pass: string, content: UserContent, opts: CallOpts = {}): Promise<boolean> {
-    if (aiCalls >= MAX_AI_CALLS) return false;
-    aiCalls++;
-    try {
-      const out = await callAi(env, content, opts);
-      const parsed = parseAiOutput(out);
-      if (!parsed || parsed.tests.length === 0) {
-        logPass(requestId, pass, 0, 0, opts.model);
-        return false;
-      }
-      logPass(requestId, pass, parsed.tests.length, rangedCount(parsed.tests), opts.model);
-      adoptMerged(mergeRanges(rawTests, parsed.tests));
-      return !needsRangesRetry(tests);
-    } catch {
-      console.error(JSON.stringify({ level: "error", context: "extraction_pass_failed", requestId, pass }));
-      return false;
-    }
-  }
-
-  if (needsRangesRetry(tests)) {
-    // Pass 2: ranges-only retry on the same image and prompt.
-    const done2 = await tryJsonPass(
-      "pass2_ranges_retry",
-      makeUserContent(`${RANGES_RETRY_NOTE}\n\n${buildPrompt()}${reportSuffix}`),
-    );
-    // Pass 3: one section at a time, only where ranges are still missing.
-    if (!done2 && needsRangesRetry(tests)) {
-      for (const section of ["hematology", "biochemistry"] as const) {
-        if (!needsRangesRetry(tests) || !sectionNeedsRetry(tests, section)) continue;
-        await tryJsonPass(
-          `pass3_${section}`,
-          makeUserContent(`${sectionPrompt(section)}${reportSuffix}`),
-        );
-      }
-    }
-    // Pass 4 (image only): range-column-only — list ONLY the ranges.
-    if (needsRangesRetry(tests) && imageDataUri && aiCalls < MAX_AI_CALLS) {
-      aiCalls++;
-      try {
-        const columnText = await callText(env, [
-          { type: "text", text: buildRangeColumnPrompt() },
-          { type: "image_url", image_url: { url: imageDataUri } },
-        ]);
-        const columnRows = parseRangeColumn(columnText);
-        logPass(requestId, "pass4_range_column", columnRows.length, columnRows.length);
-        if (columnRows.length > 0) adoptMerged(mergeRanges(rawTests, columnRows));
-      } catch {
-        // Keep the best result so far; missing ranges stay unknown.
-      }
-    }
-    // Pass 5 (image only): transcribe verbatim, then structure the text.
-    // Needs 2 calls left in the budget.
-    if (needsRangesRetry(tests) && imageDataUri && aiCalls < MAX_AI_CALLS - 1) {
-      aiCalls++;
-      try {
-        const transcription = await callText(env, [
-          { type: "text", text: buildTranscriptionPrompt() },
-          { type: "image_url", image_url: { url: imageDataUri } },
-        ]);
-        const counted = countTranscription(transcription);
-        logPass(requestId, "pass5_transcribe", counted.rows, counted.ranged);
-        if (counted.rows > 0) {
-          await tryJsonPass(
-            "pass5_structure",
-            `${buildPrompt()}\n\nمتن رونویسی‌شده از برگه:\n<REPORT>\n${transcription.slice(0, 20000)}\n</REPORT>`,
-          );
-        }
-      } catch {
-        // Keep the best result so far; missing ranges stay unknown.
-      }
-    }
-    // Pass 6: deterministic re-read (temperature 0, top_p 1).
-    if (needsRangesRetry(tests)) {
-      await tryJsonPass(
-        "pass6_deterministic",
-        makeUserContent(`${RANGES_RETRY_NOTE}\n\n${buildPrompt()}${reportSuffix}`),
-        { temperature: 0, topP: 1 },
-      );
-    }
-    // Pass 7: alternate vision models, one attempt each (no guided_json;
-    // Zod validates the JSON instead).
-    if (needsRangesRetry(tests)) {
-      for (const model of MODEL_FALLBACKS) {
-        if (!needsRangesRetry(tests)) break;
-        await tryJsonPass(
-          `pass7_alt_${model.slice(model.lastIndexOf("/") + 1)}`,
-          userContent,
-          { model, guidedJson: false },
-        );
-      }
-    }
-    // Pass 8 (image only): Jimp-enhanced image, then full extraction.
-    if (needsRangesRetry(tests) && imageDataUri && aiCalls < MAX_AI_CALLS) {
-      try {
-        const enhanced = await enhanceImage(bytes);
-        if (enhanced) {
-          await tryJsonPass("pass8_enhanced_image", [
-            { type: "text", text: buildPrompt() },
-            { type: "image_url", image_url: { url: enhanced } },
-          ]);
-        }
-      } catch {
-        // Keep the best result so far; missing ranges stay unknown.
-      }
-    }
-  }
-  const modelLimitations = data.limitations;
-  const summary = sanitizeSummary(data.summary);
-  const result: AnalysisResult = {
-    summary: summary || `این گزارش آزمایش خون شامل نتایج ${tests.length} آزمایش است.`,
-    tests,
-    limitations: [...limitations, ...filterLimitations(modelLimitations, tests)],
-    disclaimer: DISCLAIMER,
+  const input: PipelineInput = {
+    env,
     requestId,
+    imageDataUri,
+    bytes,
+    documentText,
+    isWebp: nameLower.endsWith(".webp") || file.type.toLowerCase() === "image/webp",
+    callTimeoutMs: opts.callTimeoutMs ?? CALL_TIMEOUT_MS,
+    timeBudgetMs: opts.timeBudgetMs ?? TIME_BUDGET_MS,
+    send: () => {},
   };
-  console.log(
-    JSON.stringify({
-      level: "info",
-      context: "analysis_completed",
-      requestId,
-      totalTests: tests.length,
-      unknownTests: tests.filter((t) => t.status === "unknown").length,
-    }),
-  );
-  return json(result);
+
+  // Plain JSON mode (fallback when streaming fails): same pipeline,
+  // stage events discarded.
+  if (new URL(request.url).searchParams.get("stream") === "0") {
+    try {
+      const { result } = await runPipeline(input);
+      return json(result);
+    } catch (e) {
+      if (e instanceof ApiError) return error(e.message, requestId, e.status);
+      throw e;
+    }
+  }
+
+  // Streaming mode: newline-delimited JSON events — one stage event per
+  // round as it actually starts, then {"done": true, "result", "stopReason"}.
+  const streamBody = new ReadableStream({
+    async start(controller) {
+      const enc = new TextEncoder();
+      const send = (event: Record<string, unknown>): void => {
+        try {
+          controller.enqueue(enc.encode(`${JSON.stringify(event)}\n`));
+        } catch {
+          // Consumer gone; the pipeline still finishes server-side.
+        }
+      };
+      try {
+        const { result, stopReason } = await runPipeline({ ...input, send });
+        send({ done: true, result, stopReason });
+      } catch (e) {
+        if (e instanceof ApiError) send({ error: e.message, requestId });
+        else send({ error: "خطایی رخ داد. دوباره تلاش کنید.", requestId });
+      } finally {
+        try {
+          controller.close();
+        } catch {
+          // Already closed.
+        }
+      }
+    },
+  });
+  return new Response(streamBody, {
+    headers: {
+      "Content-Type": "application/x-ndjson; charset=UTF-8",
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
 }

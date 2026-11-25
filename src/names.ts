@@ -127,6 +127,17 @@ function candidates(s: string): string[] {
   return out;
 }
 
+/** White-cell differential counts: on most sheets they are printed
+ *  with a value but genuinely no reference range, so they must not
+ *  count against the ranges score. Canonical Persian names. */
+export const DIFFERENTIAL_NAMES = new Set([
+  "نوتروفیل",
+  "لنفوسیت",
+  "مونوسیت",
+  "ائوزینوفیل",
+  "بازوفیل",
+]);
+
 export function canonical(abbr: string | null, name: string | null): Entry | null {
   for (const s of [abbr, name]) {
     if (!s) continue;

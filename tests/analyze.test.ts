@@ -38,7 +38,60 @@ const RANGED = DROPPED.map((t, i) => ({
   ][i] ?? null,
 }));
 
-function mockEnv(response: unknown, calls: { n: number }): Env {
+const RANGE_LINES = RANGED.map((t) => `${t.name} — ${t.reference_range ?? "(no range)"}`).join("\n");
+
+function jsonResponse(tests: unknown): { response: string } {
+  return { response: JSON.stringify({ summary: "", tests, limitations: [] }) };
+}
+
+function userText(options: any): string {
+  const c = options?.messages?.[1]?.content;
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) {
+    return c.filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n");
+  }
+  return "";
+}
+
+/** Mock AI that answers by prompt kind. A "hang" route never resolves. */
+function routingMockEnv(
+  routes: Partial<Record<string, unknown>>,
+  calls: { n: number; maxActive: number },
+): Env {
+  let active = 0;
+  return {
+    AI: {
+      run: (async (_model: string, options: any) => {
+        calls.n++;
+        active++;
+        calls.maxActive = Math.max(calls.maxActive, active);
+        try {
+          // Small delay so concurrent round-mates actually overlap.
+          await new Promise((r) => setTimeout(r, 10));
+          const text = userText(options);
+          let kind = "full";
+          if (text.includes("فقط ستون بازه مرجع")) kind = "range_column";
+          else if (text.includes("فقط بخش هماتولوژی")) kind = "section_hematology";
+          else if (text.includes("فقط بخش بیوشیمی")) kind = "section_biochemistry";
+          else if (text.includes("در پاسخ قبلی محدوده مرجع")) kind = "ranges_only";
+          else if (text.includes("متن رونویسی‌شده از برگه")) kind = "structure";
+          else if (text.includes("رونویسی کن")) kind = "transcription";
+          const res = routes[kind] ?? routes.full;
+          if (res === "hang") await new Promise(() => {});
+          return res;
+        } finally {
+          active--;
+        }
+      }) as never,
+      toMarkdown: (async () => {
+        throw new Error("toMarkdown must not be called in this test");
+      }) as never,
+    },
+    ASSETS: {} as Fetcher,
+  } as unknown as Env;
+}
+
+function simpleMockEnv(response: unknown, calls: { n: number }): Env {
   return {
     AI: {
       run: (async () => {
@@ -53,21 +106,66 @@ function mockEnv(response: unknown, calls: { n: number }): Env {
   } as unknown as Env;
 }
 
-async function postFile(env: Env, file: File): Promise<{ status: number; body: any }> {
+async function postFile(
+  env: Env,
+  file: File,
+  opts?: { callTimeoutMs?: number },
+): Promise<{ status: number; body: any; events: any[] }> {
   const form = new FormData();
   form.set("file", file);
   const res = await analyze(
     new Request("http://localhost/api/analyze", { method: "POST", body: form }),
     env,
     "test0001",
+    opts ?? {},
   );
-  return { status: res.status, body: await res.json() };
+  const text = await res.text();
+  const contentType = res.headers.get("content-type") || "";
+  if (contentType.includes("ndjson")) {
+    const events = text.split("\n").filter(Boolean).map((l) => JSON.parse(l));
+    const doneEv = events.find((e) => e.done);
+    return { status: res.status, body: doneEv ? doneEv.result : null, events };
+  }
+  return { status: res.status, body: text ? JSON.parse(text) : null, events: [] };
 }
+
+function counts(body: any): { normal: number; low: number; unknown: number } {
+  return {
+    normal: body.tests.filter((t: any) => t.status === "normal").length,
+    low: body.tests.filter((t: any) => t.status === "low").length,
+    unknown: body.tests.filter((t: any) => t.status === "unknown").length,
+  };
+}
+
+const JPG = new File([new Uint8Array([1, 2, 3, 4])], "lab.jpg", { type: "image/jpeg" });
+
+test("round 1 parallel merge: full without ranges + range-column-only restores them in 2 concurrent calls", async () => {
+  const calls = { n: 0, maxActive: 0 };
+  const env = routingMockEnv(
+    { full: jsonResponse(DROPPED), range_column: { response: RANGE_LINES } },
+    calls,
+  );
+  const { status, body } = await postFile(env, JPG);
+  assert.equal(status, 200);
+  assert.equal(body.tests.length, 20);
+  assert.deepEqual(counts(body), { normal: 15, low: 1, unknown: 4 });
+  assert.equal(calls.n, 2, "round 1 is exactly two concurrent calls, then early exit");
+  assert.ok(calls.maxActive >= 2, `expected the two round-1 calls to overlap, maxActive=${calls.maxActive}`);
+});
+
+test("pipeline early exit: ranges on round 1 cost exactly 2 AI calls (full + range-column in parallel)", async () => {
+  const calls = { n: 0 };
+  const env = simpleMockEnv({ summary: "", tests: RANGED, limitations: [] }, calls);
+  const { status, body } = await postFile(env, JPG);
+  assert.equal(status, 200);
+  assert.equal(calls.n, 2);
+  assert.deepEqual(counts(body), { normal: 15, low: 1, unknown: 4 });
+});
 
 test("pipeline cap: a sheet that never yields ranges costs at most 8 AI calls", async () => {
   const calls = { n: 0 };
-  const env = mockEnv({ summary: "", tests: DROPPED, limitations: [] }, calls);
-  const { status, body } = await postFile(env, new File([new Uint8Array([1, 2, 3, 4])], "lab.jpg", { type: "image/jpeg" }));
+  const env = simpleMockEnv({ summary: "", tests: DROPPED, limitations: [] }, calls);
+  const { status, body } = await postFile(env, JPG);
   assert.equal(status, 200);
   assert.equal(body.tests.length, 20);
   assert.ok(body.tests.every((t: any) => t.status === "unknown"));
@@ -75,20 +173,43 @@ test("pipeline cap: a sheet that never yields ranges costs at most 8 AI calls", 
   assert.ok(calls.n >= 5, `expected the fallback passes to run, got ${calls.n}`);
 });
 
-test("pipeline early exit: ranges on pass 1 cost exactly 1 AI call", async () => {
-  const calls = { n: 0 };
-  const env = mockEnv({ summary: "", tests: RANGED, limitations: [] }, calls);
-  const { status, body } = await postFile(env, new File([new Uint8Array([1, 2, 3, 4])], "lab.jpg", { type: "image/jpeg" }));
+test("timeout: a hanging range-column call is skipped after the timeout and the pipeline still returns the best result", async () => {
+  const calls = { n: 0, maxActive: 0 };
+  const env = routingMockEnv(
+    {
+      full: jsonResponse(DROPPED),
+      range_column: "hang",
+      section_hematology: jsonResponse(RANGED),
+      section_biochemistry: jsonResponse(RANGED),
+      ranges_only: jsonResponse(RANGED),
+    },
+    calls,
+  );
+  const started = Date.now();
+  const { status, body } = await postFile(env, JPG, { callTimeoutMs: 50 });
+  assert.ok(Date.now() - started < 5000, "the hanging call must not stall the pipeline");
   assert.equal(status, 200);
-  assert.equal(calls.n, 1);
-  assert.equal(body.tests.filter((t: any) => t.status === "normal").length, 15);
-  assert.equal(body.tests.filter((t: any) => t.status === "low").length, 1);
-  assert.equal(body.tests.filter((t: any) => t.status === "unknown").length, 4);
+  assert.deepEqual(counts(body), { normal: 15, low: 1, unknown: 4 });
+  assert.equal(calls.n, 5, "full + range-column (timed out) + 3 round-2 calls");
+});
+
+test("SSE event format: stage events in order, then done with the result", async () => {
+  const calls = { n: 0 };
+  const env = simpleMockEnv({ summary: "", tests: RANGED, limitations: [] }, calls);
+  const { status, body, events } = await postFile(env, JPG);
+  assert.equal(status, 200);
+  assert.equal(events[0].stage, "reading_table");
+  assert.equal(events[0].progress, 25);
+  const doneEv = events[events.length - 1];
+  assert.equal(doneEv.done, true);
+  assert.equal(doneEv.stopReason, "good_enough");
+  assert.equal(doneEv.result.tests.length, 20);
+  assert.equal(body.tests.length, 20);
 });
 
 test("PDF deterministic path: text PDF costs 0 AI calls, 15/1/4", async () => {
   const calls = { n: 0 };
-  const env = mockEnv({ summary: "", tests: [], limitations: [] }, calls);
+  const env = simpleMockEnv({ summary: "", tests: [], limitations: [] }, calls);
   const lines = [
     "Hematology",
     "W.B.C. 4.5 x1000/uL 4.5-11.5",
@@ -118,8 +239,6 @@ test("PDF deterministic path: text PDF costs 0 AI calls, 15/1/4", async () => {
   assert.equal(status, 200);
   assert.equal(calls.n, 0, "deterministic PDF path must not call AI");
   assert.equal(body.tests.length, 20);
-  assert.equal(body.tests.filter((t: any) => t.status === "normal").length, 15);
-  assert.equal(body.tests.filter((t: any) => t.status === "low").length, 1);
-  assert.equal(body.tests.filter((t: any) => t.status === "unknown").length, 4);
+  assert.deepEqual(counts(body), { normal: 15, low: 1, unknown: 4 });
   assert.equal(body.tests[0].name, "گلبول سفید");
 });

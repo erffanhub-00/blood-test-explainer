@@ -32,14 +32,48 @@ function el(tag, className, text) {
   return node;
 }
 
-function setProgress(percent, label) {
+const STAGE_LABELS = {
+  reading_table: "در حال خواندن جدول آزمایش…",
+  reading_ranges: "در حال خواندن بازه‌ها…",
+  reading_sections: "در حال خواندن بخش‌ها…",
+  transcribing: "در حال رونویسی جدول…",
+  trying_other_model: "در حال تلاش با مدل دیگر…",
+  enhancing_image: "در حال واضح‌تر کردن عکس…",
+};
+
+// Progress state: percent null during upload (no fake percentage —
+// fetch has no upload progress, only the honest "sending…" note).
+let currentPercent = 0;
+let currentStageLabel = "";
+let elapsedTimer = null;
+let elapsedStart = Date.now();
+
+function renderProgress() {
   progressWrap.classList.add("show");
-  progressFill.style.width = Math.round(percent) + "%";
-  progressPercent.textContent = Math.round(percent) + "%";
-  progressStepName.textContent = label;
+  progressFill.style.width = (currentPercent === null ? 5 : Math.round(currentPercent)) + "%";
+  progressPercent.textContent = currentPercent === null ? "" : Math.round(currentPercent) + "%";
+  const sec = Math.floor((Date.now() - elapsedStart) / 1000);
+  progressStepName.textContent = currentStageLabel + (sec > 0 ? " (" + sec + " ثانیه)" : "");
+}
+
+function setProgress(percent, label) {
+  currentPercent = percent;
+  currentStageLabel = label;
+  renderProgress();
+}
+
+function startElapsedTimer() {
+  stopElapsedTimer();
+  elapsedStart = Date.now();
+  elapsedTimer = setInterval(renderProgress, 1000);
+}
+
+function stopElapsedTimer() {
+  if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
 }
 
 function hideProgress() {
+  stopElapsedTimer();
   progressWrap.classList.remove("show");
   progressFill.style.width = "0%";
   progressPercent.textContent = "0%";
@@ -103,22 +137,61 @@ function validateFile(file) {
   return null;
 }
 
-/** Real upload progress from XMLHttpRequest — no fake timer. */
-function upload(formData) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", "/api/analyze");
-    xhr.responseType = "json";
-    xhr.upload.addEventListener("progress", (e) => {
-      if (e.lengthComputable) setProgress((e.loaded / e.total) * 90, "ارسال فایل…");
-    });
-    xhr.addEventListener("load", () => {
-      setProgress(95, "تحلیل با هوش مصنوعی…");
-      resolve({ status: xhr.status, data: xhr.response });
-    });
-    xhr.addEventListener("error", () => reject(new Error("ارسال فایل ناموفق بود.")));
-    xhr.send(formData);
-  });
+/** Streamed analysis: NDJSON stage events as each round really starts,
+ *  then the result. Throws {message, requestId, retryable} — retryable
+ *  only for transport failures, never for a server error event. */
+async function analyzeStream(formData) {
+  let res;
+  try {
+    res = await fetch("/api/analyze", { method: "POST", body: formData });
+  } catch {
+    throw { message: "اتصال به سرور برقرار نشد.", retryable: true };
+  }
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw { message: (data && data.error) || "پردازش ناموفق بود.", requestId: data && data.requestId, retryable: false };
+  }
+  const contentType = res.headers.get("content-type") || "";
+  if (!contentType.includes("ndjson")) return await res.json();
+  let reader;
+  try {
+    reader = res.body.getReader();
+  } catch {
+    throw { message: "خواندن پاسخ سرور ممکن نشد.", retryable: true };
+  }
+  const decoder = new TextDecoder();
+  let buf = "";
+  let result = null;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (!line) continue;
+        const ev = JSON.parse(line);
+        if (ev.stage) setProgress(ev.progress ?? 50, STAGE_LABELS[ev.stage] || ev.stage);
+        else if (ev.done) result = ev.result;
+        else if (ev.error) throw { message: ev.error, requestId: ev.requestId, retryable: false };
+      }
+    }
+  } catch (err) {
+    if (err && err.retryable === false) throw err;
+    throw { message: "اتصال هنگام دریافت نتیجه قطع شد.", retryable: true };
+  }
+  if (!result) throw { message: "پاسخ سرور ناقص بود.", retryable: true };
+  return result;
+}
+
+/** Plain-JSON fallback when streaming fails (same pipeline, no events). */
+async function analyzePlain(formData) {
+  const res = await fetch("/api/analyze?stream=0", { method: "POST", body: formData });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw { message: (data && data.error) || "پردازش ناموفق بود.", requestId: data && data.requestId };
+  return data;
 }
 
 function testCard(test) {
@@ -239,14 +312,26 @@ form.addEventListener("submit", async (event) => {
   if (validationError) return showError(validationError);
   submitButton.disabled = true;
   setProgress(0, "آماده‌سازی…");
+  startElapsedTimer();
   setMessage("فایل در حال پردازش است؛ لطفاً صبر کنید.", "info");
 
   try {
     file = await compressImage(file);
     const formData = new FormData();
     formData.append("file", file, file.name);
-    const { status, data } = await upload(formData);
-    if (status !== 200) throw { message: (data && data.error) || "پردازش ناموفق بود.", requestId: data && data.requestId };
+    // No upload percentage: fetch has no upload progress. The note is
+    // honest — the first stage event means the file arrived.
+    setProgress(null, "در حال ارسال فایل…");
+    let data;
+    try {
+      data = await analyzeStream(formData);
+    } catch (err) {
+      if (err && err.retryable) {
+        setMessage("اتصال قطع شد؛ دوباره تلاش می‌کنم…", "info");
+        setProgress(null, "در حال ارسال فایل…");
+        data = await analyzePlain(formData);
+      } else throw err;
+    }
     lastResult = data;
     renderResult(data);
     setMessage("بررسی فایل با موفقیت انجام شد.", "success");
