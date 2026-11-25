@@ -1,0 +1,10 @@
+name = "blood-test-explainer"
+main = "src/index.ts"
+compatibility_date = "2025-11-25"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+[ai]
+binding = "AI"
