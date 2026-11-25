@@ -9,19 +9,23 @@
 ## چطور کار می‌کند
 
 1. فایل PDF یا عکس (JPG, PNG, WEBP، حداکثر ۱۰ مگابایت) را ارسال می‌کنید.
-2. متن PDF با `AI.toMarkdown` خوانده می‌شود؛ عکس مستقیم به مدل بینایی داده می‌شود.
-3. مدل `@cf/meta/llama-4-scout-17b-16e-instruct` با `guided_json` فقط استخراج می‌کند: نام، مخفف، مقدار، واحد و بازه مرجع.
-4. بقیه کار دست کد است، نه مدل:
+2. **PDF متنی بدون هوش مصنوعی خوانده می‌شود:** متن PDF با `unpdf` در خود ورکر استخراج و جدول آن با کد پارس می‌شود؛ اگر جدول کامل باشد، صفر فراخوانی AI انجام می‌شود. PDF اسکن‌شده (بدون لایه متن) با `AI.toMarkdown` خوانده می‌شود.
+3. **عکس با چند روش پشت سر هم پردازش می‌شود** تا بازه مرجع حتماً خوانده شود (هر مرحله فقط وقتی اجرا می‌شود که مرحله قبل بازه‌ها را کامل نکرده باشد؛ سقف ۸ فراخوانی AI):
+   استخراج کامل → تکرار فقط‌بازه → هر بخش جدا (هماتولوژی، بیوشیمی) → فقط ستون بازه → رونویسی متنی جدول و ساختاردهی آن → بازخوانی قطعی (temperature 0) → مدل بینایی جایگزین → عکس بهبودیافته با Jimp (کنتراست، خاکستری، شارپ). هر مرحله فقط بازه‌ها و واحدهای خالی را پر می‌کند؛ مقدارها هرگز بازنویسی نمی‌شوند.
+4. مدل `@cf/meta/llama-4-scout-17b-16e-instruct` با `guided_json` فقط استخراج می‌کند: نام، مخفف، مقدار، واحد، بازه مرجع و (فقط برای آزمایش‌های ناشناخته) یک جمله تعریف. خروجی مدل با Zod اعتبارسنجی می‌شود.
+5. بقیه کار دست کد است، نه مدل:
    - اعداد فارسی و عربی به انگلیسی تبدیل می‌شوند.
    - هر مقدار و بازه باید عیناً در متن برگه پیدا شود، وگرنه «خوانا نیست» می‌شود.
    - وضعیت (داخل بازه / بالاتر / پایین‌تر / نامشخص) را کد، با مقایسه عدد و بازه، حساب می‌کند.
    - جمله توضیح از یک قالب ثابت و با همان وضعیت تاییدشده ساخته می‌شود؛ جمله آزاد مدل هرگز استفاده نمی‌شود.
-5. فایل ذخیره نمی‌شود و بعد از پردازش نگه داشته نمی‌شود.
+   - توضیح هر آزمایش اول از دیکشنری داخلی (کبد، کلیه، چربی خون، دیابت، تیروئید، هورمون، آهن، التهاب و غیره) می‌آید، بعد از تعریف مدل، و فقط در آخر جمله کلی.
+6. فایل ذخیره نمی‌شود و بعد از پردازش نگه داشته نمی‌شود.
 
 ### نکته‌ها
 
 - در بسیاری از برگه‌ها، شمارش افتراقی (نوتروفیل، لنفوسیت، مونوسیت، ائوزینوفیل) بازه مرجع ندارد؛ این موارد با وضعیت «نامشخص» و جمله «بازه روی برگه نیست» نشان داده می‌شوند، نه با مقایسه حدسی.
 - برگه PDF اسکن‌شده یا عکس‌گرفته‌شده متن ندارد؛ اگر متن PDF خوانا نباشد، خطای واضح می‌گیرید و باید عکس واضح برگه را بفرستید.
+- عکس در مرورگر هم پیش‌پردازش می‌شود: تا ۲۴۰۰ پیکسل با جزئیات کامل و کنتراست ملایم ارسال می‌شود تا چاپ کوچک برگه خوانا بماند.
 
 ### چرا جمله و برچسب نمی‌توانند با هم تناقض داشته باشند؟
 
@@ -34,15 +38,16 @@
 ```
 src/
   index.ts       # فقط روت /api/analyze — فایل‌های استاتیک از public سرو می‌شوند
-  analyze.ts     # اعتبارسنجی فایل، خواندن PDF/عکس، فراخوانی Workers AI
-  validation.ts  # نرمال‌سازی اعداد، پارس بازه، وضعیت قطعی، grounding، جمله قالب
-  names.ts       # اسم‌های فارسی استاندارد + جمله عمومی هر آزمایش
-  prompt.ts      # پرامپت سیستم و اسکیمای JSON
-  types.ts       # تایپ‌ها و ثابت‌ها
+  analyze.ts     # اعتبارسنجی فایل، مسیر PDF قطعی، خط لوله چندمرحله‌ای Workers AI
+  pdfparse.ts    # استخراج متن PDF با unpdf + پارس قطعی جدول آزمایش
+  validation.ts  # نرمال‌سازی اعداد، پارس بازه، وضعیت قطعی، grounding، جمله قالب، اعتبارسنجی Zod
+  names.ts       # اسم‌های فارسی استاندارد + جمله عمومی هر آزمایش (~۹۰ آزمایش)
+  prompt.ts      # پرامپت سیستم و اسکیمای JSON + پرامپت‌های مرحله‌های مختلف
+  types.ts       # تایپ‌ها و ثابت‌ها (مدل‌ها، بخش‌ها)
 public/
   index.html  style.css  app.js  sample.json
 tests/
-  validation.test.ts  names.test.ts
+  validation.test.ts  names.test.ts  pdfparse.test.ts  analyze.test.ts
 ```
 
 ## اجرا
@@ -81,9 +86,10 @@ Upload a blood test sheet (PDF or photo) and get each result explained in simple
 ## How it works
 
 1. Upload a PDF or image (JPG, PNG, WEBP, max 10 MB).
-2. PDF text is read with `AI.toMarkdown`; images go straight to the vision model.
-3. The model (`@cf/meta/llama-4-scout-17b-16e-instruct`, `guided_json`) only extracts: name, abbreviation, value, unit and reference range.
-4. Everything else is deterministic code, not the model:
+2. **Text PDFs need no AI at all:** the text layer is extracted in the Worker with `unpdf` and the table is parsed by code; a complete table costs zero AI calls. Scanned PDFs (no text layer) are read with `AI.toMarkdown`.
+3. **Photos go through several strategies in sequence** until the reference ranges are read (each step runs only if the previous one left ranges missing; max 8 AI calls): full extraction → ranges-only retry → one section at a time → range-column-only → verbatim transcription + structuring → deterministic re-read (temperature 0) → alternate vision model → Jimp-enhanced image. Each step only fills missing ranges/units; values are never overwritten.
+4. The model (`@cf/meta/llama-4-scout-17b-16e-instruct`, `guided_json`) only extracts: name, abbreviation, value, unit, reference range and (only for unknown tests) a one-sentence definition. Its JSON is validated with Zod.
+5. Everything else is deterministic code, not the model:
    - Persian/Arabic digits are normalized to Latin.
    - Every value and range must appear verbatim in the source text, otherwise it becomes "unreadable".
    - The status (in range / above / below / unknown) is computed in code by comparing the number with the range.

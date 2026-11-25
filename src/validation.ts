@@ -1,6 +1,42 @@
-import type { RawTest, Status, Test } from "./types.js";
+import type { RawTest, Section, Status, Test } from "./types.js";
 import { MAX_TESTS } from "./types.js";
 import { canonical, fixSpelling } from "./names.js";
+import { z } from "zod";
+
+/** Strict boundary check for AI output (Zod guards only the AI boundary;
+ *  malformed JSON or wrong shape is a parse failure for the retry path). */
+const AiTestSchema = z.object({
+  name: z.string().min(1).max(150), abbr: z.string().max(40).nullish(),
+  value: z.union([z.string(), z.number()]).nullish(), unit: z.string().max(50).nullish(),
+  reference_range: z.string().max(100).nullish(), section: z.string().nullish(),
+  definition: z.string().max(300).nullish(),
+});
+
+const AiOutputSchema = z.object({
+  summary: z.string().nullish(),
+  tests: z.array(AiTestSchema).max(MAX_TESTS),
+  limitations: z.array(z.string()).nullish(),
+});
+
+export function parseAiOutput(output: string): {
+  summary: string | null;
+  tests: RawTest[];
+  limitations: string[];
+} | null {
+  let data: unknown;
+  try {
+    data = JSON.parse(output);
+  } catch {
+    return null;
+  }
+  const result = AiOutputSchema.safeParse(data);
+  if (!result.success) return null;
+  return {
+    summary: result.data.summary ?? null,
+    tests: result.data.tests as RawTest[],
+    limitations: result.data.limitations ?? [],
+  };
+}
 
 /** Persian/Arabic digits → Latin. Runs before any comparison. */
 export function normalizeDigits(input: string | number | null | undefined): string | null {
@@ -149,6 +185,16 @@ function safeText(value: unknown, maxLength: number): string | null {
   return s.slice(0, maxLength);
 }
 
+/** Words that must never appear in a model-supplied definition. */
+const BLOCKED_DEFINITION = ["تشخیص", "درمان", "دارو", "بیماری"];
+
+function cleanDefinition(raw: unknown): string | null {
+  const s = safeText(raw, 200);
+  if (!s) return null;
+  if (BLOCKED_DEFINITION.some((w) => s.includes(w))) return null;
+  return fixSpelling(s);
+}
+
 /** Strip patient identifiers from the summary. */
 export function sanitizeSummary(summary: string | null): string {
   if (!summary) return "";
@@ -160,6 +206,11 @@ export function sanitizeSummary(summary: string | null): string {
     .replace(/\s+([،.])/g, "$1")
     .trim();
 }
+
+const SECTIONS = new Set([
+  "hematology", "biochemistry", "liver", "kidney", "lipids", "diabetes",
+  "thyroid", "hormones", "immunology", "urine",
+]);
 
 /** Turn raw model output into validated tests. Unknown tests also
  *  produce a limitation line, so nothing is silently dropped. */
@@ -175,17 +226,18 @@ export function processTests(
     const abbr = safeText(raw?.abbr, 40);
     const entry = canonical(abbr, safeText(raw?.name, 150));
     const name = entry ? entry[0] : fixSpelling(safeText(raw?.name, 150) ?? "نامشخص");
+    // Dictionary first, model definition second, generic last resort.
     const info = entry
       ? entry[1]
-      : "این آزمایش یکی از موارد برگه آزمایش است.";
+      : (cleanDefinition(raw?.definition) ?? "این آزمایش یکی از موارد برگه آزمایش است.");
 
     let value = normalizeDigits(safeText(raw?.value, 80));
     let range = normalizeDigits(safeText(raw?.reference_range, 100));
     if (value !== null && !isGrounded(value, sourceText)) value = null;
     if (range !== null && !isGrounded(range, sourceText)) range = null;
 
-    const section = raw?.section === "hematology" || raw?.section === "biochemistry"
-      ? raw.section
+    const section: Section = SECTIONS.has(raw?.section ?? "")
+      ? raw.section as Section
       : "other";
     const status = validateStatus(value, range);
     const unit = safeText(raw?.unit, 50);
@@ -212,30 +264,74 @@ export function processTests(
   return { tests, limitations };
 }
 
+/** Range coverage: how many valued tests have a range. Drives pass selection. */
+export function rangesCoverage(tests: Test[]): { valued: number; ranged: number; ratio: number } {
+  const valued = tests.filter((t) => t.value !== null).length;
+  const ranged = tests.filter((t) => t.value !== null && t.reference_range !== null).length;
+  return { valued, ranged, ratio: valued === 0 ? 1 : ranged / valued };
+}
+
 /** Retry the AI call when ranges are systematically missing: fewer
  *  than half of the valued tests have a range (range-less rows are few). */
 export function needsRangesRetry(tests: Test[]): boolean {
-  const valued = tests.filter((t) => t.value !== null);
-  if (valued.length === 0) return false;
-  const ranged = valued.filter((t) => t.reference_range !== null).length;
-  return ranged / valued.length < 0.5;
+  const { valued, ratio } = rangesCoverage(tests);
+  return valued > 0 && ratio < 0.5;
 }
 
-/** Merge a retry that refills missing ranges, matched by canonical
- *  or raw name. Values are never overwritten. */
-export function mergeRanges(original: RawTest[], retry: RawTest[]): RawTest[] {
+/** Merge fallback passes that refill missing ranges/units, matched by
+ *  canonical or raw name. Values are never overwritten, and a range
+ *  already present is never replaced. Sources are tried in order. */
+export function mergeRanges(original: RawTest[], ...sources: RawTest[][]): RawTest[] {
   const byName = new Map<string, RawTest>();
-  for (const r of retry) {
-    const entry = canonical(r.abbr ?? null, r.name ?? null);
-    if (entry) byName.set(entry[0], r);
-    if (r.name) byName.set(r.name, r);
+  for (const src of sources) {
+    for (const r of src) {
+      const entry = canonical(r.abbr ?? null, r.name ?? null);
+      if (entry) byName.set(entry[0], r);
+      if (r.name) byName.set(r.name, r);
+    }
   }
   return original.map((t) => {
-    if (t.reference_range) return t;
     const entry = canonical(t.abbr ?? null, t.name ?? null);
     const hit = (entry ? byName.get(entry[0]) : undefined) ?? (t.name ? byName.get(t.name) : undefined);
-    return hit?.reference_range ? { ...t, reference_range: hit.reference_range } : t;
+    if (!hit) return t;
+    const out = { ...t };
+    if (!out.reference_range && hit.reference_range) out.reference_range = hit.reference_range;
+    if (!out.unit && hit.unit) out.unit = hit.unit;
+    return out;
   });
+}
+
+/** Parse the range-column-only pass ("W.B.C. — 4.5-11.5" lines).
+ *  Name + range only; values are never taken from this pass. */
+export function parseRangeColumn(text: string): RawTest[] {
+  const out: RawTest[] = [];
+  for (const line of text.split("\n")) {
+    const m = line.match(/^(.+?)\s*[—–-]\s*(.+)$/);
+    if (!m) continue;
+    const name = m[1].trim();
+    if (/^(test|نام)$/i.test(name)) continue;
+    const range = m[2].trim().replace(/[()]/g, "").trim();
+    if (!name || !range) continue;
+    if (/^(no range|بدون بازه|null)$/i.test(range)) continue;
+    out.push({ name, reference_range: range });
+  }
+  return out;
+}
+
+/** Count rows and rows-with-range in a verbatim "|"-separated
+ *  transcription (pass 4). Header lines are skipped. */
+export function countTranscription(text: string): { rows: number; ranged: number } {
+  let rows = 0;
+  let ranged = 0;
+  for (const line of text.split("\n")) {
+    const parts = line.split("|").map((p) => p.trim());
+    if (parts.length < 4 || !parts[0]) continue;
+    if (/^(test|نام)$/i.test(parts[0])) continue;
+    rows++;
+    const r = parts[3].replace(/[()]/g, "").trim().toLowerCase();
+    if (r && r !== "no range" && r !== "بدون بازه" && r !== "null" && r !== "-") ranged++;
+  }
+  return { rows, ranged };
 }
 
 /** Keep a model limitation only if it does not contradict a test

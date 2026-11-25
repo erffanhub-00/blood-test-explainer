@@ -13,8 +13,10 @@ const progressStepName = document.getElementById("progressStepName");
 
 const ALLOWED_EXT = [".pdf", ".jpg", ".jpeg", ".png", ".webp"];
 const MAX_SIZE = 10 * 1024 * 1024;
-const MAX_DIM = 1200;
-const JPEG_QUALITY = 0.78;
+// Full detail up to 2400px (the old 1200px cap shrank a 1440x1920 photo
+// before the model ever saw it), re-encoded at readable quality.
+const MAX_DIM = 2400;
+const JPEG_QUALITY = 0.88;
 
 const STATUS_LABELS = {
   normal: "✓ در محدوده برگه",
@@ -57,8 +59,10 @@ function showError(text, requestId) {
   setMessage(text + (requestId ? " (شناسه پیگیری: " + requestId + ")" : ""), "error");
 }
 
+/** Client preprocessing: downscale past 2400px + mild contrast lift.
+ *  Any failure sends the original untouched. */
 async function compressImage(file) {
-  if (!file.type.startsWith("image/") || file.size < 400 * 1024) return file;
+  if (!file.type.startsWith("image/")) return file;
   return new Promise((resolve) => {
     const img = new Image();
     const url = URL.createObjectURL(file);
@@ -73,7 +77,9 @@ async function compressImage(file) {
       const canvas = document.createElement("canvas");
       canvas.width = width;
       canvas.height = height;
-      canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+      const ctx = canvas.getContext("2d");
+      try { ctx.filter = "contrast(1.12)"; } catch { /* filter unsupported: plain draw */ }
+      ctx.drawImage(img, 0, 0, width, height);
       canvas.toBlob((blob) => {
         if (!blob) return resolve(file);
         resolve(new File([blob], file.name.replace(/\.[^.]+$/, "") + ".jpg", { type: "image/jpeg" }));
@@ -177,6 +183,14 @@ function renderResult(data) {
   const sections = [
     ["hematology", "هماتولوژی"],
     ["biochemistry", "بیوشیمی"],
+    ["liver", "کبد"],
+    ["kidney", "کلیه"],
+    ["lipids", "چربی خون"],
+    ["diabetes", "قند خون و دیابت"],
+    ["thyroid", "تیروئید"],
+    ["hormones", "هورمون‌ها"],
+    ["immunology", "ایمنی"],
+    ["urine", "ادرار"],
     ["other", "سایر"],
   ];
   for (const [key, title] of sections) {

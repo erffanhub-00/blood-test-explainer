@@ -4,16 +4,20 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath, URL as NodeURL } from "node:url";
 import {
   buildExplanation,
+  countTranscription,
   displayRange,
   mergeRanges,
   needsRangesRetry,
+  parseAiOutput,
+  parseRangeColumn,
   normalizeDigits,
   parseRange,
   parseValue,
   processTests,
+  rangesCoverage,
   validateStatus,
 } from "../src/validation.js";
-import { buildPrompt } from "../src/prompt.js";
+import { buildPrompt, buildTranscriptionPrompt, sectionPrompt } from "../src/prompt.js";
 
 test("normalizeDigits converts Persian and Arabic digits", () => {
   assert.equal(normalizeDigits("۲۱۰"), "210");
@@ -135,17 +139,30 @@ const RAW_SAMPLE = [
   { name: "Cholesterol", abbr: "Cholesterol", value: "210", unit: "mg/dL", reference_range: "0-200", section: "biochemistry" },
   { name: "Ferritin", abbr: "Ferritin", value: "85", unit: "ng/mL", reference_range: null, section: "biochemistry" },
   { name: "TG", abbr: "TG", value: null, unit: "mg/dL", reference_range: "0-150", section: "biochemistry" },
+  { name: "TSH", abbr: "TSH", value: "2.1", unit: "mIU/L", reference_range: "0.4-4.0", section: "thyroid" },
+  { name: "HDL", abbr: "HDL", value: "55", unit: "mg/dL", reference_range: "40-60", section: "lipids" },
+  { name: "LDL", abbr: "LDL", value: "90", unit: "mg/dL", reference_range: "0-100", section: "lipids" },
+  { name: "FBS", abbr: "FBS", value: "92", unit: "mg/dL", reference_range: "70-99", section: "diabetes" },
+  { name: "HbA1c", abbr: "HbA1c", value: "5.4", unit: "%", reference_range: "4.0-5.6", section: "diabetes" },
 ];
 
-test("sample: 6 normal, 1 high, 2 unknown", () => {
+test("sample: 11 normal, 1 high, 2 unknown", () => {
   const { tests, limitations } = processTests(RAW_SAMPLE, "");
-  assert.equal(tests.length, 9);
+  assert.equal(tests.length, 14);
   assert.deepEqual(
     tests.map((t) => t.status),
-    ["normal", "normal", "normal", "normal", "normal", "normal", "high", "unknown", "unknown"],
+    ["normal", "normal", "normal", "normal", "normal", "normal", "high", "unknown", "unknown", "normal", "normal", "normal", "normal", "normal"],
   );
   assert.equal(tests[6].name, "کلسترول کل");
   assert.ok(tests[6].explanation.includes("مقدار 210 بالاتر از بازه 0 تا 200 روی برگه است"));
+  assert.equal(tests[9].name, "هورمون محرک تیروئید");
+  assert.equal(tests[9].section, "thyroid");
+  assert.equal(tests[10].name, "لیپوپروتئین با چگالی بالا");
+  assert.equal(tests[10].section, "lipids");
+  assert.equal(tests[12].name, "قند خون ناشتا");
+  assert.equal(tests[12].section, "diabetes");
+  assert.equal(tests[13].name, "هموگلوبین A1c");
+  assert.equal(tests[13].section, "diabetes");
   assert.deepEqual(limitations, ["فریتین: بازه روی برگه نیست.", "تری‌گلیسرید: مقدار خوانا نیست."]);
 });
 
@@ -155,7 +172,7 @@ test("sample.json is exactly what processTests produces", () => {
   );
   const { tests } = processTests(RAW_SAMPLE, "");
   assert.deepEqual(sample.tests, tests);
-  assert.equal(sample.tests.length, 9);
+  assert.equal(sample.tests.length, 14);
 });
 
 test("grounding: a value not in the source text is dropped", () => {
@@ -312,4 +329,205 @@ test("buildPrompt anchors the model to the range column (v1 regression)", () => 
   assert.ok(prompt.includes("Neutrophil"));
   assert.ok(prompt.includes("%"));
   assert.ok(prompt.includes("گلبول سفید"));
+});
+
+test("rangesCoverage drives pass selection: 0/20 continues, 16/20 stops, 8/20 continues", () => {
+  // His run on the deployed v1: 20 valued tests, 0 ranges -> more passes.
+  const dropped = processTests(REAL_SHEET.map((t) => ({ ...t, reference_range: null })), "").tests;
+  assert.deepEqual(rangesCoverage(dropped), { valued: 20, ranged: 0, ratio: 0 });
+  assert.equal(needsRangesRetry(dropped), true);
+  // The real sheet: 16 of 20 ranged, only the differential has none -> stop.
+  const real = processTests(REAL_SHEET, "").tests;
+  assert.deepEqual(rangesCoverage(real), { valued: 20, ranged: 16, ratio: 0.8 });
+  assert.equal(needsRangesRetry(real), false);
+  // Partial loss (8 of 20 ranged) is still a failure, not "unknown".
+  const partial = processTests(
+    REAL_SHEET.map((t, i) => ({ ...t, reference_range: i < 8 ? t.reference_range : null })),
+    "",
+  ).tests;
+  assert.deepEqual(rangesCoverage(partial), { valued: 20, ranged: 8, ratio: 0.4 });
+  assert.equal(needsRangesRetry(partial), true);
+});
+
+test("mergeRanges merges section passes: 13 hematology + 7 biochemistry, differential stays null", () => {
+  const dropped = REAL_SHEET.map((t) => ({ ...t, reference_range: null }));
+  const hema = REAL_SHEET.filter((t) => t.section === "hematology");
+  const bio = REAL_SHEET.filter((t) => t.section === "biochemistry");
+  const merged = mergeRanges(dropped, hema, bio);
+  const { tests, limitations } = processTests(merged, "");
+  assert.equal(tests.filter((t) => t.status === "normal").length, 15);
+  assert.equal(tests.filter((t) => t.status === "low").length, 1);
+  assert.equal(tests.filter((t) => t.status === "unknown").length, 4);
+  assert.equal(tests[0].reference_range, "4.5-11.5");
+  assert.equal(tests[14].reference_range, "0.7-1.4");
+  assert.equal(tests[15].reference_range, "Up to 40");
+  assert.equal(tests[19].reference_range, "<0.5");
+  assert.equal(limitations.length, 4);
+});
+
+test("mergeRanges fills a missing unit without touching the value", () => {
+  const merged = mergeRanges(
+    [{ name: "Neutrophil", abbr: null, value: "46", unit: null, reference_range: null }],
+    [{ name: "Neutrophil", abbr: null, value: "46", unit: "%", reference_range: null }],
+  );
+  assert.equal(merged[0].unit, "%");
+  assert.equal(merged[0].value, "46");
+  assert.equal(merged[0].reference_range, null);
+});
+
+test("mergeRanges from the transcription pass: ranges restored, wrong values never overwrite", () => {
+  // Simulate pass 4 structuring with corrupted values: only the ranges
+  // may be adopted; the first pass's values are the ground truth.
+  const dropped = REAL_SHEET.map((t) => ({ ...t, reference_range: null }));
+  const transcribed = REAL_SHEET.map((t) => ({ ...t, value: "999" }));
+  const merged = mergeRanges(dropped, transcribed);
+  assert.equal(merged[0].value, "4.5");
+  assert.equal(merged[0].reference_range, "4.5-11.5");
+  assert.equal(merged[3].value, "40.6");
+  assert.equal(merged[3].reference_range, "41.5-50.4");
+  const { tests } = processTests(merged, "");
+  assert.equal(tests.filter((t) => t.status === "normal").length, 15);
+  assert.equal(tests.filter((t) => t.status === "low").length, 1);
+  assert.equal(tests.filter((t) => t.status === "unknown").length, 4);
+});
+
+test("countTranscription counts rows and ranges in a verbatim transcription", () => {
+  const text = [
+    "W.B.C. | 4.5 | x1000/µL | 4.5-11.5",
+    "Neutrophil | 46 | % | (no range)",
+    "A.S.T.(SGOT) | 18 | U/L | Up to 40",
+    "Bilirubin Direct | 0.2 | mg/dL | <0.5",
+    "",
+  ].join("\n");
+  assert.deepEqual(countTranscription(text), { rows: 4, ranged: 3 });
+  assert.deepEqual(countTranscription(""), { rows: 0, ranged: 0 });
+  assert.deepEqual(
+    countTranscription("Test | Value | Unit | Reference Range\nWBC | 6.2 | 10^3/uL | 4.0-11.0"),
+    { rows: 1, ranged: 1 },
+  );
+});
+
+test("sectionPrompt targets one section only and anchors the range column", () => {
+  const hema = sectionPrompt("hematology");
+  assert.ok(hema.includes("Hematology"));
+  assert.ok(hema.includes("hematology"));
+  assert.ok(hema.includes("Reference Interval"));
+  assert.ok(hema.includes("4.5-11.5"));
+  assert.ok(hema.includes("Up to 40"));
+  assert.ok(!hema.includes("Biochemistry"));
+  assert.ok(!hema.includes("biochemistry"));
+  const bio = sectionPrompt("biochemistry");
+  assert.ok(bio.includes("Biochemistry"));
+  assert.ok(bio.includes("biochemistry"));
+  assert.ok(bio.includes("Reference Interval"));
+  assert.ok(!bio.includes("Hematology"));
+  assert.ok(!bio.includes("hematology"));
+});
+
+test("transcription prompt asks for plain-text rows, not JSON", () => {
+  const prompt = buildTranscriptionPrompt();
+  assert.ok(prompt.includes("نام | مقدار | واحد | بازه مرجع"));
+  assert.ok(prompt.includes("W.B.C. | 4.5 | x1000/µL | 4.5-11.5"));
+  assert.ok(prompt.includes("(no range)"));
+  assert.ok(prompt.includes("بدون JSON"));
+});
+
+test("parseRangeColumn: name — range lines, skips (no range)", () => {
+  const rows = parseRangeColumn([
+    "W.B.C. — 4.5-11.5",
+    "H.C.T — 41.5-50.4",
+    "Neutrophil — (no range)",
+    "A.S.T.(SGOT) — Up to 40",
+    "Bilirubin Direct — <0.5",
+    "not a row",
+    "",
+  ].join("\n"));
+  assert.equal(rows.length, 4);
+  assert.equal(rows[0].name, "W.B.C.");
+  assert.equal(rows[0].reference_range, "4.5-11.5");
+  assert.equal(rows[1].reference_range, "41.5-50.4");
+  assert.equal(rows[2].reference_range, "Up to 40");
+  assert.equal(rows[3].reference_range, "<0.5");
+  assert.equal(rows[0].value, undefined);
+});
+
+test("mergeRanges from the range-column pass restores 15/1/4", () => {
+  const dropped = REAL_SHEET.map((t) => ({ ...t, reference_range: null }));
+  const column = parseRangeColumn(
+    REAL_SHEET.filter((t) => t.reference_range)
+      .map((t) => `${t.name} — ${t.reference_range}`)
+      .join("\n"),
+  );
+  const { tests } = processTests(mergeRanges(dropped, column), "");
+  assert.equal(tests.filter((t) => t.status === "normal").length, 15);
+  assert.equal(tests.filter((t) => t.status === "low").length, 1);
+  assert.equal(tests.filter((t) => t.status === "unknown").length, 4);
+});
+
+test("parseAiOutput: valid JSON passes, malformed or wrong shape fails", () => {
+  const ok = parseAiOutput(JSON.stringify({
+    summary: "s",
+    tests: [{ name: "Hb", value: "13.9", reference_range: "12-16", definition: "d" }],
+    limitations: [],
+  }));
+  assert.ok(ok);
+  assert.equal(ok.tests[0].name, "Hb");
+  assert.equal(ok.tests[0].definition, "d");
+  assert.equal(parseAiOutput("{not json"), null);
+  assert.equal(parseAiOutput(JSON.stringify({ summary: "s", tests: "nope" })), null);
+  assert.equal(parseAiOutput(JSON.stringify({ summary: "s", tests: [{ value: "1" }] })), null);
+  assert.equal(parseAiOutput(JSON.stringify({ summary: "s", tests: [{ name: "Hb", value: "1", reference_range: 5 }] })), null);
+});
+
+test("dictionary covers new panels: TSH, HbA1c, HDL, LDL, eGFR, Vitamin D", () => {
+  const { tests } = processTests([
+    { name: "T.S.H.", abbr: "T.S.H.", value: "2.1", unit: "mIU/L", reference_range: "0.4-4.0", section: "thyroid" },
+    { name: "HbA1c", abbr: "HbA1c", value: "5.4", unit: "%", reference_range: "4.0-5.6", section: "diabetes" },
+    { name: "HDL", abbr: "HDL", value: "55", unit: "mg/dL", reference_range: "40-60", section: "lipids" },
+    { name: "LDL", abbr: "LDL", value: "90", unit: "mg/dL", reference_range: "0-100", section: "lipids" },
+    { name: "eGFR", abbr: "eGFR", value: "95", unit: "mL/min", reference_range: "90-120", section: "kidney" },
+    { name: "Vitamin D", abbr: null, value: "32", unit: "ng/mL", reference_range: "30-100", section: "hormones" },
+    { name: "Ferritin", abbr: "Ferritin", value: "85", unit: "ng/mL", reference_range: null, section: "biochemistry" },
+  ], "");
+  assert.deepEqual(
+    tests.map((t) => t.name),
+    ["هورمون محرک تیروئید", "هموگلوبین A1c", "لیپوپروتئین با چگالی بالا", "لیپوپروتئین با چگالی پایین", "فیلتراسیون گلومرولی تخمینی", "ویتامین D", "فریتین"],
+  );
+  assert.ok(tests.every((t) => !t.explanation.includes("یکی از موارد برگه آزمایش")));
+  assert.equal(tests[6].status, "unknown");
+  assert.ok(tests[6].explanation.includes("فریتین ذخیره آهن بدن را نشان می‌دهد"));
+});
+
+test("unknown test: model definition used, blocked words dropped, else generic", () => {
+  const { tests } = processTests([
+    { name: "Zeta-9", abbr: null, value: "3.1", unit: "U/L", reference_range: "1-5", definition: "این آزمایش میزان یک پروتئین خاص خون را اندازه می‌گیرد." },
+    { name: "Omega-2", abbr: null, value: "7", unit: "mg/dL", reference_range: "2-9", definition: "این آزمایش برای تشخیص بیماری کبد استفاده می‌شود." },
+    { name: "Kappa-4", abbr: null, value: "2", unit: "mg/dL", reference_range: "1-4", definition: null },
+  ], "");
+  assert.ok(tests[0].explanation.startsWith("این آزمایش میزان یک پروتئین خاص خون را اندازه می‌گیرد."));
+  assert.ok(tests[0].explanation.includes("مقدار 3.1 در بازه 1 تا 5 روی برگه است"));
+  assert.ok(tests[1].explanation.startsWith("این آزمایش یکی از موارد برگه آزمایش است."));
+  assert.ok(tests[2].explanation.startsWith("این آزمایش یکی از موارد برگه آزمایش است."));
+});
+
+test("definition is capped at 200 chars", () => {
+  const { tests } = processTests([
+    { name: "Zeta-9", abbr: null, value: "3.1", unit: "U/L", reference_range: "1-5", definition: "ا".repeat(250) },
+  ], "");
+  assert.ok(!tests[0].explanation.includes("ا".repeat(201)));
+  assert.ok(tests[0].explanation.includes("ا".repeat(200)));
+});
+
+test("liver panel keeps its section and validates", () => {
+  const { tests } = processTests([
+    { name: "ALT", abbr: "ALT", value: "21", unit: "U/L", reference_range: "Up to 40", section: "liver" },
+    { name: "AST", abbr: "AST", value: "18", unit: "U/L", reference_range: "Up to 40", section: "liver" },
+    { name: "ALP", abbr: "ALP", value: "283", unit: "IU/L", reference_range: "80-468", section: "liver" },
+    { name: "Bilirubin Total", abbr: null, value: "0.4", unit: "mg/dL", reference_range: "0.2-1.2", section: "liver" },
+    { name: "GGT", abbr: "GGT", value: "35", unit: "U/L", reference_range: "0-60", section: "liver" },
+  ], "");
+  assert.ok(tests.every((t) => t.section === "liver"));
+  assert.ok(tests.every((t) => t.status === "normal"));
+  assert.equal(tests[0].name, "آلانین آمینوترانسفراز");
+  assert.equal(tests[4].name, "گاما گلوتامیل ترانسفراز");
 });
